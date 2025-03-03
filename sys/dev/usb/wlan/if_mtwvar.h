@@ -38,8 +38,8 @@
 
 struct mtw_rx_radiotap_header {
 	struct ieee80211_radiotap_header wr_ihdr;
-        uint64_t	wr_tsf;
-        uint8_t		wr_flags;
+	uint64_t	wr_tsf;
+	uint8_t		wr_flags;
 	uint8_t		wr_rate;
 	uint16_t	wr_chan_freq;
 	uint16_t	wr_chan_flags;
@@ -58,10 +58,10 @@ struct mtw_rx_radiotap_header {
 struct mtw_tx_radiotap_header {
 	struct ieee80211_radiotap_header wt_ihdr;
 	uint8_t		wt_flags;
-  uint8_t		wt_rate;
+	uint8_t		wt_rate;
 	uint16_t	wt_chan_freq;
 	uint16_t	wt_chan_flags;
-  uint8_t		wt_hwqueue;
+	uint8_t		wt_hwqueue;
 } __packed;
 
 #define MTW_TX_RADIOTAP_PRESENT				\
@@ -72,11 +72,11 @@ struct mtw_tx_radiotap_header {
 struct mtw_softc;
 
 struct mtw_fw_data {
-  	uint16_t	len;
+	uint16_t	len;
 	uint16_t	flags;
 
-  uint8_t *buf;
-  uint32_t buflen;
+	uint8_t *buf;
+	uint32_t buflen;
 
 };
 struct mtw_tx_desc {
@@ -129,10 +129,10 @@ struct mtw_tx_data {
 	struct usbd_xfer	*xfer;
 	uint8_t			qid;
 	uint8_t			ridx;
-  uint32_t			buflen;
-  //struct mtw_tx_desc desc;
+	uint32_t			buflen;
+	//struct mtw_tx_desc desc;
 	struct ieee80211_node	*ni;
-  //struct mtw_txd desc;
+	//struct mtw_txd desc;
 	uint8_t	desc[sizeof(struct mtw_txd)+sizeof(struct mtw_txwi)];
 
 };
@@ -200,8 +200,8 @@ struct mtw_host_cmd_ring {
 
 struct mtw_node {
 	struct ieee80211_node	ni;
-       uint8_t			mgt_ridx;
-      uint8_t			amrr_ridx;
+	uint8_t			mgt_ridx;
+	uint8_t			amrr_ridx;
 	uint8_t			fix_ridx;
 
 };
@@ -252,8 +252,8 @@ struct mtw_cmdq {
 enum {
 	MTW_BULK_RX,		/* = WME_AC_BK */
 	//MTW_BULK_RX1,
-       MTW_BULK_TX_BE,		/* = WME_AC_BE */
-       MTW_BULK_TX_VI,		/* = WME_AC_VI */
+	MTW_BULK_TX_BE,		/* = WME_AC_BE */
+	MTW_BULK_TX_VI,		/* = WME_AC_VI */
 	MTW_BULK_TX_VO,		/* = WME_AC_VO */
 	MTW_BULK_TX_HCCA,
 	MTW_BULK_TX_PRIO,
@@ -270,33 +270,33 @@ enum {
 #define	MTW_RUNNING			0x02
 struct mtw_softc {
 	device_t			sc_dev;
-  int                             sc_idx;
+	int                             sc_idx;
 	struct ieee80211com		sc_ic;
-        struct ieee80211_ratectl_tx_stats sc_txs;
+	struct ieee80211_ratectl_tx_stats sc_txs;
 	int				(*sc_newstate)(struct ieee80211com *,
-					    enum ieee80211_state, int);
+								   enum ieee80211_state, int);
 	int				(*sc_srom_read)(struct mtw_softc *,
-	    uint16_t, uint16_t *);
+									uint16_t, uint16_t *);
 #define	MTW_CMDQ_MAX	16
 #define	MTW_CMDQ_MASQ	(MTW_CMDQ_MAX - 1)
 #define	MTW_CMDQ_ABORT	0
 #define	MTW_CMDQ_GO	1
 	struct mbuf			*rx_m;
-        uint8_t				runbmap;
-        uint8_t				running;
-        uint8_t				ap_running;
+	uint8_t				runbmap;
+	uint8_t				running;
+	uint8_t				ap_running;
 	uint8_t				adhoc_running;
-        uint8_t				sta_running;
+	uint8_t				sta_running;
 	uint8_t fwloading;
-        uint16_t			wcid_stats[MTW_WCID_MAX + 1][3];
-        struct mbufq			sc_snd;
-        uint8_t				cmdq_exec;
-        uint8_t				fifo_cnt;
+	uint16_t			wcid_stats[MTW_WCID_MAX + 1][3];
+	struct mbufq			sc_snd;
+	uint8_t				cmdq_exec;
+	uint8_t				fifo_cnt;
 	uint32_t                        sc_flags;
-        uint8_t				rvp_cnt;
-        uint8_t				cmdq_run;
-        uint8_t				rvp_bmap;
-        struct mtw_cmdq			cmdq[MTW_CMDQ_MAX];
+	uint8_t				rvp_cnt;
+	uint8_t				cmdq_run;
+	uint8_t				rvp_bmap;
+	struct mtw_cmdq			cmdq[MTW_CMDQ_MAX];
 	struct task			cmdq_task;
 	uint8_t				cmdq_mtw;
 	uint8_t				cmdq_key_set;
@@ -304,22 +304,22 @@ struct mtw_softc {
 	struct usb_interface		*sc_iface;
 	uint32_t			cmdq_store;
 	struct mtx                      sc_mtx;
-  uint32_t                              sc_mcu_xferlen;
-        struct usb_xfer			*sc_xfer[MTW_N_XFER];
+	uint32_t                              sc_mcu_xferlen;
+	struct usb_xfer			*sc_xfer[MTW_N_XFER];
 	uint16_t			asic_ver;
 	uint16_t			asic_rev;
 	uint16_t			mac_ver;
 	uint16_t			mac_rev;
 	uint16_t			rf_rev;
-        int ridx;
-  int amrr_ridx;
+	int ridx;
+	int amrr_ridx;
 	uint8_t				freq;
 	uint8_t				ntxchains;
 	uint8_t				nrxchains;
 
-  struct mtw_txd_fw *txd_fw[4];
-  int sc_sent;
-  uint8_t sc_ivb_1[MTW_MCU_IVB_LEN];
+	struct mtw_txd_fw *txd_fw[4];
+	int sc_sent;
+	uint8_t sc_ivb_1[MTW_MCU_IVB_LEN];
 	struct mtw_endpoint_queue	sc_epq[MTW_BULK_RX];
 	uint8_t				rfswitch;
 	uint8_t				ext_2ghz_lna;
