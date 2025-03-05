@@ -163,7 +163,7 @@ static void mtw_cmdq_cb(void *, int);
 static void mtw_setup_tx_list(struct mtw_softc *, struct mtw_endpoint_queue *);
 static void mtw_unsetup_tx_list(struct mtw_softc *,
 				struct mtw_endpoint_queue *);
-static void mtw_load_microcode(void *arg);
+static int mtw_load_microcode(struct mtw_softc *);
 
 static usb_error_t mtw_do_request(struct mtw_softc *,
 				  struct usb_device_request *, void *);
@@ -353,7 +353,7 @@ static const struct usb_config mtw_config[MTW_N_XFER] = {
 		.flags = {.pipe_bof = 1,
 			  .force_short_xfer = 1, .no_pipe_ok = 1,},
 		.callback = mtw_fw_callback,
-
+		.timeout = 5000,	/* ms */
 	},
 
 	[MTW_BULK_RAW_TX] = {
@@ -520,7 +520,6 @@ mtw_attach(device_t self)
 	device_set_usb_desc(self);
 	sc->sc_udev = uaa->device;
 	sc->sc_dev = self;
-	sc->sc_sent = 0;
 
 	mtx_init(&sc->sc_mtx, device_get_nameunit(sc->sc_dev),
                  MTX_NETWORK_LOCK, MTX_DEF);
@@ -536,13 +535,7 @@ mtw_attach(device_t self)
 		    usbd_errstr(error));
 		goto detach;
 	}
-	for (i = 0; i < 4; i++) {
-		sc->txd_fw[i] = (struct mtw_txd_fw *)
-		    malloc(sizeof(struct mtw_txd_fw),
-			M_USBDEV, M_NOWAIT | M_ZERO);
-	}
 	MTW_LOCK(sc);
-	sc->sc_idx = 0;
 	mbufq_init(&sc->sc_snd, ifqmaxlen);
 
 	/*enable WLAN core */
@@ -576,11 +569,10 @@ mtw_attach(device_t self)
 		goto detach;
 	}
 
-	mtw_load_microcode(sc);
-	ret = msleep(&sc->fwloading, &sc->sc_mtx, 0, "fwload", 3 * hz);
-	if (ret == EWOULDBLOCK || sc->fwloading != 1) {
+	ret = mtw_load_microcode(sc);
+	if (ret != 0) {
 		device_printf(sc->sc_dev,
-		    "timeout waiting for MCU to initialize\n");
+			"error loading firmware: %d\n", ret);
 		goto detach;
 	}
 
@@ -725,10 +717,6 @@ mtw_detach(device_t self)
 		ieee80211_draintask(ic, &sc->ratectl_task);
 		ieee80211_ifdetach(ic);
 	}
-	for (i = 0; i < 4; i++) {
-		free(sc->txd_fw[i], M_USBDEV);
-	}
-	firmware_unregister("/mediatek/mt7601u");
 	mtx_destroy(&sc->sc_mtx);
 
 	return (0);
@@ -1009,7 +997,6 @@ mtw_usb_dma_write(struct mtw_softc *sc, uint32_t val)
 static void
 mtw_ucode_setup(struct mtw_softc *sc)
 {
-
 	mtw_usb_dma_write(sc, (MTW_USB_TX_EN | MTW_USB_RX_EN));
 	mtw_write(sc, MTW_FCE_PSE_CTRL, 1);
 	mtw_write(sc, MTW_TX_CPU_FCE_BASE, 0x400230);
@@ -1018,151 +1005,136 @@ mtw_ucode_setup(struct mtw_softc *sc)
 	mtw_write(sc, MTW_FCE_PDMA, 0x44);
 	mtw_write(sc, MTW_FCE_SKIP_FS, 3);
 }
+
 static int
-mtw_ucode_write(struct mtw_softc *sc, const uint8_t *fw, const uint8_t *ivb,
-    int32_t len, uint32_t offset)
+mtw_ucode_write(struct mtw_softc *sc, const uint8_t *fw, int32_t len,
+	uint32_t offset)
 {
+	struct usb_xfer *xfer;
+	struct usb_page_cache *frame;
+	struct mtw_txd txd;
+	uint32_t blksz, sent, xferlen, tmp;
 
-	// struct usb_attach_arg *uaa = device_get_ivars(sc->sc_dev);
-#if 0 // firmware not tested
-
+	blksz = 0x2000;
 	if (sc->asic_ver == 0x7612 && offset >= 0x90000)
 		blksz = 0x800; /* MT7612 ROM Patch */
 
-	xfer = usbd_alloc_xfer(sc->sc_udev);
-	if (xfer == NULL) {
-		error = ENOMEM;
-		goto fail;
-	}
-	buf = usbd_alloc_buffer(xfer, blksz + 12);
-	if (buf == NULL) {
-		error = ENOMEM;
-		goto fail;
-	}
-#endif
+	xfer = sc->sc_xfer[MTW_BULK_FW_CMD];
 
+	sent = 0;
+	for (;;) {
+		xferlen = min(len - sent, blksz);
+		if (xferlen == 0)
+			break;
 
+		txd.len = htole16(xferlen);
+		txd.flags = htole16(MTW_TXD_DATA | MTW_TXD_MCU);
 
-	int mlen;
-	int idx = 0;
+		usbd_xfer_set_frames(xfer, 1);
+		usbd_xfer_set_frame_len(xfer, 0,
+			xferlen + sizeof(struct mtw_txd) + MTW_DMA_PAD);
 
-	mlen = 0x2c44;
+		frame = usbd_xfer_get_frame(xfer, 0);
+		usbd_copy_in(frame, 0, &txd, sizeof(struct mtw_txd));
+		usbd_copy_in(frame, sizeof(struct mtw_txd), fw + sent, xferlen);
+		usbd_frame_zero(frame, sizeof(struct mtw_txd) + xferlen, MTW_DMA_PAD);
 
-	while (len > 0) {
+		mtw_write_cfg(sc, MTW_MCU_DMA_ADDR, offset + sent);
+		mtw_write_cfg(sc, MTW_MCU_DMA_LEN, (xferlen << 16));
 
-		if (len < 0x2c44 && len > 0) {
-			mlen = len;
+		sc->sc_mcu_xfer_status = 0;
+		usbd_transfer_start(xfer);
+		msleep(&sc->sc_mcu_xfer_status, &sc->sc_mtx, 0,
+			"mtw_ucode_write", MTW_TX_TIMEOUT);
+
+		if (sc->sc_mcu_xfer_status <= 0) {
+			usbd_transfer_stop(xfer);
+			return -1;
 		}
 
-		sc->txd_fw[idx]->len = htole16(mlen);
-		sc->txd_fw[idx]->flags = htole16(MTW_TXD_DATA | MTW_TXD_MCU);
+		mtw_read(sc, MTW_MCU_FW_IDX, &tmp);
+		mtw_write(sc, MTW_MCU_FW_IDX, tmp++);
 
-		memcpy(&sc->txd_fw[idx]->fw, fw, mlen);
-		// memcpy(&txd[1], fw, mlen);
-		//	memset(&txd[1]  + mlen, 0, MTW_DMA_PAD);
-		//		mtw_write_cfg(sc, MTW_MCU_DMA_ADDR, offset
-		//+sent); 1mtw_write_cfg(sc, MTW_MCU_DMA_LEN, (mlen << 16));
-
-		//	  sc->sc_fw_data[idx]->len=htole16(mlen);
-
-		// memcpy(tmpbuf,fw,mlen);
-		// memset(tmpbuf+mlen,0,MTW_DMA_PAD);
-		// memcpy(sc->sc_fw_data[idx].buf, fw, mlen);
-
-		fw += mlen;
-		len -= mlen;
-		// sent+=mlen;
-		idx++;
+		sent += xferlen;
 	}
-	sc->sc_sent = 0;
-	memcpy(sc->sc_ivb_1, ivb, MTW_MCU_IVB_LEN);
 
-	usbd_transfer_start(sc->sc_xfer[7]);
-
-	return (0);
+	return 0;
 }
 
-static void
-mtw_load_microcode(void *arg)
+static int
+mtw_load_microcode(struct mtw_softc *sc)
 {
-
-	struct mtw_softc *sc = (struct mtw_softc *)arg;
-	const struct mtw_ucode_hdr *hdr;
-	// onst struct mtw_ucode *fw = NULL;
 	const char *fwname;
-	size_t size;
-	int error = 0;
-	uint32_t tmp, iofs = 0x40;
-	//	int ntries;
+	const struct firmware *firmware;
+	uint32_t tmp, iofs, dofs;
+	int ntries, error;
 	int dlen, ilen;
-	device_printf(sc->sc_dev, "version:0x%hx\n", sc->asic_ver);
+
 	/* is firmware already running? */
 	mtw_read_cfg(sc, MTW_MCU_DMA_ADDR, &tmp);
-	if (tmp == MTW_MCU_READY) {
-		return;
-	}
+	if (tmp == MTW_MCU_READY)
+		return 0;
+
 	if (sc->asic_ver == 0x7612) {
 		fwname = "mtw-mt7662u_rom_patch";
 
-		const struct firmware *firmware = firmware_get_flags(fwname,FIRMWARE_GET_NOWARN);
+		firmware = firmware_get_flags(fwname, FIRMWARE_GET_NOWARN);
 		if (firmware == NULL) {
 			device_printf(sc->sc_dev,
 			    "failed loadfirmware of file %s (error %d)\n",
 			    fwname, error);
-			return;
+			return -1;
 		}
-		size = firmware->datasize;
 
 		const struct mtw_ucode *fw = (const struct mtw_ucode *)
-						 firmware->data;
-		hdr = (const struct mtw_ucode_hdr *)&fw->hdr;
-		// memcpy(fw,(const unsigned char*)firmware->data +
-		// 0x1e,size-0x1e);
-		ilen = size - 0x1e;
+			((u_char *)firmware->data + 0x1e);
+		ilen = firmware->datasize - 0x1e;
 
 		mtw_ucode_setup(sc);
 
-		if ((error = mtw_ucode_write(sc, firmware->data, fw->ivb, ilen,
-			 0x90000)) != 0) {
-			goto fail;
-		}
+		error = mtw_ucode_write(sc, fw->data, ilen, 0x90000);
+		firmware_put(firmware, FIRMWARE_UNLOAD);
+
+		if (error != 0)
+			return error;
+
 		mtw_usb_dma_write(sc, 0x00e41814);
 	}
 
 	fwname = "/mediatek/mt7601u.bin";
 	iofs = 0x40;
-	// dofs = 0;
+	dofs = 0;
 	if (sc->asic_ver == 0x7612) {
 		fwname = "mtw-mt7662u";
 		iofs = 0x80040;
-		//	dofs = 0x110800;
+		dofs = 0x110800;
 	} else if (sc->asic_ver == 0x7610) {
-		fwname = "mt7610u";
-		// dofs = 0x80000;
+		fwname = "mtw-mt7610u";
+		dofs = 0x80000;
 	}
-	MTW_UNLOCK(sc);
-	const struct firmware *firmware = firmware_get_flags(fwname, FIRMWARE_GET_NOWARN);
 
+	MTW_UNLOCK(sc);
+	firmware = firmware_get_flags(fwname, FIRMWARE_GET_NOWARN);
 	if (firmware == NULL) {
 		device_printf(sc->sc_dev,
 		    "failed loadfirmware of file %s (error %d)\n", fwname,
 		    error);
 		MTW_LOCK(sc);
-		return;
+		return -1;
 	}
 	MTW_LOCK(sc);
-	size = firmware->datasize;
-	MTW_DPRINTF(sc, MTW_DEBUG_FIRMWARE, "firmware size:%zu\n", size);
-	const struct mtw_ucode *fw = (const struct mtw_ucode *)firmware->data;
 
-	if (size < sizeof(struct mtw_ucode_hdr)) {
+	MTW_DPRINTF(sc, MTW_DEBUG_FIRMWARE, "firmware size:%zu\n", firmware->datasize);
+
+	if (firmware->datasize < sizeof(struct mtw_ucode_hdr)) {
 		device_printf(sc->sc_dev, "firmware header too short\n");
 		goto fail;
 	}
 
-	hdr = (const struct mtw_ucode_hdr *)&fw->hdr;
+	const struct mtw_ucode *fw = (const struct mtw_ucode *)firmware->data;
+	const struct mtw_ucode_hdr *hdr = &fw->hdr;
 
-	if (size < sizeof(struct mtw_ucode_hdr) + le32toh(hdr->ilm_len) +
+	if (firmware->datasize < sizeof(struct mtw_ucode_hdr) + le32toh(hdr->ilm_len) +
 		le32toh(hdr->dlm_len)) {
 		device_printf(sc->sc_dev, "firmware payload too short\n");
 		goto fail;
@@ -1171,7 +1143,7 @@ mtw_load_microcode(void *arg)
 	ilen = le32toh(hdr->ilm_len) - MTW_MCU_IVB_LEN;
 	dlen = le32toh(hdr->dlm_len);
 
-	if (ilen > size || dlen > size) {
+	if (ilen > firmware->datasize || dlen > firmware->datasize) {
 		device_printf(sc->sc_dev, "firmware payload too large\n");
 		goto fail;
 	}
@@ -1180,17 +1152,19 @@ mtw_load_microcode(void *arg)
 	mtw_write(sc, MTW_FCE_PSE_CTRL, 0);
 	mtw_ucode_setup(sc);
 
-	if ((error = mtw_ucode_write(sc, fw->data, fw->ivb, ilen, iofs)) != 0)
+	if ((error = mtw_ucode_write(sc, fw->data, ilen, iofs)) != 0) {
 		device_printf(sc->sc_dev, "Could not write ucode errro=%d\n",
 		    error);
+	} else {
+		device_printf(sc->sc_dev, "loaded firmware ver %.8x %.8x %s\n",
+			le32toh(hdr->fw_ver), le32toh(hdr->build_ver), hdr->build_time);
+	}
 
-	device_printf(sc->sc_dev, "loaded firmware ver %.8x %.8x %s\n",
-	    le32toh(hdr->fw_ver), le32toh(hdr->build_ver), hdr->build_time);
-
-	return;
 fail:
-	return;
+	firmware_put(firmware, FIRMWARE_UNLOAD);
+	return error;
 }
+
 static usb_error_t
 mtw_do_request(struct mtw_softc *sc, struct usb_device_request *req, void *data)
 {
@@ -1397,15 +1371,27 @@ mtw_bbp_write(struct mtw_softc *sc, uint8_t reg, uint8_t val)
 static int
 mtw_mcu_cmd(struct mtw_softc *sc, u_int8_t cmd, void *buf, int len)
 {
-	sc->sc_idx = 0;
-	sc->txd_fw[sc->sc_idx]->len = htole16(
+	struct mtw_txd txd;
+	struct usb_xfer* xfer;
+	struct usb_page_cache *frame;
+
+	txd.len = htole16(
 	    len + 8);
-	sc->txd_fw[sc->sc_idx]->flags = htole16(MTW_TXD_CMD | MTW_TXD_MCU |
+	txd.flags = htole16(MTW_TXD_CMD | MTW_TXD_MCU |
 	    (cmd & 0x1f) << MTW_TXD_CMD_SHIFT | (0 & 0xf));
 
-	memset(&sc->txd_fw[sc->sc_idx]->fw, 0, 2004);
-	memcpy(&sc->txd_fw[sc->sc_idx]->fw, buf, len);
-	usbd_transfer_start(sc->sc_xfer[7]);
+	xfer = sc->sc_xfer[7];
+
+	usbd_xfer_set_frames(xfer, 1);
+	usbd_xfer_set_frame_len(xfer, 0,
+		len + sizeof(struct mtw_txd) + MTW_DMA_PAD);
+
+	frame = usbd_xfer_get_frame(xfer, 0);
+	usbd_copy_in(frame, 0, &txd, sizeof(struct mtw_txd));
+	usbd_frame_zero(frame, sizeof(struct mtw_txd), 2004);
+	usbd_copy_in(frame, sizeof(struct mtw_txd), buf, len);
+
+	usbd_transfer_start(xfer);
 	return (0);
 }
 
@@ -2155,7 +2141,7 @@ mtw_iter_func(void *arg, struct ieee80211_node *ni)
 	uint32_t sta[3];
 	uint16_t(*wstat)[3];
 	int error, ridx;
-	uint8_t txrate = 0;
+
 
 	/* Check for special case */
 	if (sc->rvp_cnt <= 1 && vap->iv_opmode == IEEE80211_M_STA &&
@@ -2813,91 +2799,26 @@ static void
 mtw_fw_callback(struct usb_xfer *xfer, usb_error_t error)
 {
 	struct mtw_softc *sc = usbd_xfer_softc(xfer);
-
 	int actlen;
-	int ntries, tmp;
-	// struct mtw_txd *data;
 
 	usbd_xfer_status(xfer, &actlen, NULL, NULL, NULL);
-	// data = usbd_xfer_get_priv(xfer);
-	usbd_xfer_set_priv(xfer, NULL);
+
 	switch (USB_GET_STATE(xfer)) {
-
 	case USB_ST_TRANSFERRED:
-		sc->sc_sent += actlen;
-		memset(sc->txd_fw[sc->sc_idx], 0, actlen);
-
-		if (actlen < 0x2c44 && sc->sc_idx == 0) {
-			return;
-		}
-		if (sc->sc_idx == 3) {
-
-			if ((error = mtw_write_ivb(sc, sc->sc_ivb_1,
-				    MTW_MCU_IVB_LEN)) != 0) {
-				device_printf(sc->sc_dev,
-				    "Could not write ivb error:  %d\n", error);
-			}
-
-			mtw_delay(sc, 10);
-			for (ntries = 0; ntries < 100; ntries++) {
-				if ((error = mtw_read_cfg(sc, MTW_MCU_DMA_ADDR,
-					 &tmp)) != 0) {
-					device_printf(sc->sc_dev,
-				    "Could not read cfg error:  %d\n", error);
-
-				}
-				if (tmp == MTW_MCU_READY) {
-					MTW_DPRINTF(sc, MTW_DEBUG_FIRMWARE,
-					    "mcu reaady %d\n", tmp);
-					sc->fwloading = 1;
-					break;
-				}
-
-				mtw_delay(sc, 10);
-			}
-			if (ntries == 100)
-				sc->fwloading = 0;
-			wakeup(&sc->fwloading);
-			return;
-		}
-
-		if (actlen == 0x2c44) {
-			sc->sc_idx++;
-			DELAY(1000);
-		}
-
-	case USB_ST_SETUP: {
-		int dlen = 0;
-		dlen = sc->txd_fw[sc->sc_idx]->len;
-
-		mtw_write_cfg(sc, MTW_MCU_DMA_ADDR, 0x40 + sc->sc_sent);
-		mtw_write_cfg(sc, MTW_MCU_DMA_LEN, (dlen << 16));
-
-		usbd_xfer_set_frame_len(xfer, 0, dlen);
-		usbd_xfer_set_frame_data(xfer, 0, sc->txd_fw[sc->sc_idx], dlen);
-
-		// usbd_xfer_set_priv(xfer,sc->txd[sc->sc_idx]);
-		usbd_transfer_submit(xfer);
+		sc->sc_mcu_xfer_status = actlen;
+		wakeup(&sc->sc_mcu_xfer_status);
 		break;
 
-	default: /* Error */
+	case USB_ST_ERROR:
 		device_printf(sc->sc_dev, "%s:%d %s\n", __FILE__, __LINE__,
 		    usbd_errstr(error));
-		sc->fwloading = 0;
-		wakeup(&sc->fwloading);
-		/*
-		 * Print error message and clear stall
-		 * for example.
-		 */
+		sc->sc_mcu_xfer_status = -1;
+		wakeup(&sc->sc_mcu_xfer_status);
 		break;
-	}
-		/*
-		 * Here it is safe to do something without the private
-		 * USB mutex	locked.
-		 */
 	}
 	return;
 }
+
 static void
 mtw_bulk_tx_callback0(struct usb_xfer *xfer, usb_error_t error)
 {
@@ -2907,8 +2828,6 @@ mtw_bulk_tx_callback0(struct usb_xfer *xfer, usb_error_t error)
 static void
 mtw_bulk_tx_callback1(struct usb_xfer *xfer, usb_error_t error)
 {
-
-
 	mtw_bulk_tx_callbackN(xfer, error, 1);
 }
 
